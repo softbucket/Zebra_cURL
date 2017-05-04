@@ -76,6 +76,21 @@ class Zebra_cURL {
     public $threads;
 
     /**
+     * Flag for indicating a successful callback. If the callback function returns nothing, then this flag is assumed.
+     */
+    const CALLBACK_CACHABLE         = 0b0000000000000001;
+
+    /**
+     * Flag used for a callback return value. This indicates that the curl should not be cached.
+     */
+    const CALLBACK_NO_CACHE         = 0b0000000000000000;
+
+    /**
+     * Flag used for callback return value. This indicates that the the rest of the any other curl calls should be ignored.
+     */
+    const CALLBACK_EXIT_IMMEDIATELY = 0b0000000000000010;
+
+    /**
      * Used by the {@link _process} method to determine whether to run processed requests' bodies through PHP's
      * {@link http://php.net/manual/en/function.htmlentities.php htmlentities} function.
      *
@@ -274,9 +289,11 @@ class Zebra_cURL {
      *                                          {@link http://php.net/manual/en/function.htmlentities.php htmlentities}
      *                                          function.
      *
-     *  @return void
+     * @param int $threads                      Number of max threads. If set to null, then max_threads is set to MAX_VALUE.
+     *
+     * @return void
      */
-    function __construct($htmlentities = true)
+    function __construct($htmlentities = true, $threads = 10)
     {
 
         // if the cURL extension is not available, trigger an error and stop execution
@@ -293,7 +310,14 @@ class Zebra_cURL {
         // the default number of parallel, asynchronous, requests to be processed by the library at all times
         // (unless the "pause_interval" property is greater than 0, case in which it refers to the number of requests
         // to be processed before pausing)
-        $this->threads = 10;
+        if ($threads === null)
+        {
+            $this->threads = PHP_INT_MAX;
+        }
+        else
+        {
+            $this->threads = $threads;
+        }
 
         // set the user's preference on whether to run htmlentities() on the response body or not
         $this->_htmlentities = $htmlentities;
@@ -2575,11 +2599,19 @@ class Zebra_cURL {
                         // and save the callback's response, if any
                         $callback_response = call_user_func_array($request['callback'], $arguments);
 
-                    // if no callback function, we assume the response is TRUE
-                    } else $callback_response = true;
+                        // if the callback returns nothing (ie null), then default to the cachable constant
+                        if ($callback_response === null || $callback_response === true)
+                            $callback_response = static::CALLBACK_CACHABLE;
 
-                    // if caching is enabled and the callback function did not return FALSE
-                    if ($this->cache !== false && $callback_response !== false) {
+                        //if the callback used the legacy value of "false", then change it o the value for the no-cache constant
+                        else if ($callback_response === false)
+                            $callback_response = static::CALLBACK_NO_CACHE;
+
+                    // if no callback function, we assume the response is TRUE
+                    } else $callback_response = static::CALLBACK_CACHABLE;
+
+                    // if caching is enabled and the callback function did not return static::CALLBACK_NO_CACHE (note: static::CALLBACK_CACHABLE is the opposite)
+                    if ($this->cache !== false && ($callback_response & static::CALLBACK_CACHABLE)) {
 
                         // get the name of the cache file associated with the request
                         $cache_file = $this->_get_cache_file_name($request);
@@ -2592,25 +2624,32 @@ class Zebra_cURL {
 
                     }
 
-                    // if there are more URLs to process, queue the next one
-                    if (!empty($this->_requests)) $this->_queue_requests();
+                    //if the callback is flagged to immediately exit, then stop all processing of curl calls
+                    if ($callback_response & static::CALLBACK_EXIT_IMMEDIATELY)
+                    {
+                        $running = false;
+                    }
+                    else
+                    {
+                        // if there are more URLs to process, queue the next one
+                        if (!empty($this->_requests)) $this->_queue_requests();
 
-                    // remove the handle that we finished processing
-                    // this needs to be done *after* we've already queued a new URL for processing
-                    curl_multi_remove_handle($this->_multi_handle, $handle);
+                        // remove the handle that we finished processing
+                        // this needs to be done *after* we've already queued a new URL for processing
+                        curl_multi_remove_handle($this->_multi_handle, $handle);
 
-                    // make sure the handle gets closed
-                    curl_close($handle);
+                        // make sure the handle gets closed
+                        curl_close($handle);
 
-                    // if we downloaded a file
-                    if (isset($request['options'][CURLOPT_BINARYTRANSFER]) && $request['options'][CURLOPT_BINARYTRANSFER])
+                        // if we downloaded a file
+                        if (isset($request['options'][CURLOPT_BINARYTRANSFER]) && $request['options'][CURLOPT_BINARYTRANSFER])
 
-                        // close the associated file pointer
-                        fclose($this->_running['fh' . $resource_number]['file_handler']);
+                            // close the associated file pointer
+                            fclose($this->_running['fh' . $resource_number]['file_handler']);
 
-                    // we don't need the information associated with this request anymore
-                    unset($this->_running['fh' . $resource_number]);
-
+                        // we don't need the information associated with this request anymore
+                        unset($this->_running['fh' . $resource_number]);
+                    }
                 }
 
                 // waits until curl_multi_exec() returns CURLM_CALL_MULTI_PERFORM or until the timeout, whatever happens first
